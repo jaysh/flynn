@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/flynn/flynn/host/types"
 )
 
 type ExpandedFormation struct {
@@ -43,8 +45,9 @@ type ProcessType struct {
 }
 
 type Port struct {
-	Port  int    `json:"port"`
-	Proto string `json:"proto"`
+	Port    int           `json:"port"`
+	Proto   string        `json:"proto"`
+	Service *host.Service `json:"service,omitempty"`
 }
 
 type Artifact struct {

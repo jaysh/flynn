@@ -33,6 +33,10 @@ import (
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/libcontainer/netlink"
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/libcontainer/user"
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/kr/pty"
+	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/discoverd/health"
+	"github.com/flynn/flynn/host/types"
+	hh "github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/rpcplus"
 	"github.com/flynn/flynn/pkg/rpcplus/fdrpc"
 	"github.com/flynn/flynn/pkg/shutdown"
@@ -47,6 +51,7 @@ type Config struct {
 	OpenStdin bool
 	Env       map[string]string
 	Args      []string
+	Ports     []host.Port
 }
 
 const SharedPath = "/.container-shared"
@@ -395,6 +400,89 @@ func getCmdPath(c *Config) (string, error) {
 	return cmdPath, nil
 }
 
+func monitor(port host.Port, container *ContainerInit, env map[string]string) (discoverd.Heartbeater, error) {
+	config := port.Service
+	client := discoverd.NewClientWithURL(env["DISCOVERD"])
+
+	if config.Create {
+		// TODO: maybe reuse maybeAddService() from the client
+		if err := client.AddService(config.Name); err != nil {
+			if je, ok := err.(hh.JSONError); !ok || je.Code != hh.ObjectExistsError {
+				return nil, fmt.Errorf("something went wrong with discoverd: %s", err)
+			}
+		}
+	}
+	localAddr := fmt.Sprintf("127.0.0.1:%v", port.Port)
+	addr := fmt.Sprintf("%s:%v", env["EXTERNAL_IP"], port.Port)
+
+	// no checker, but we still want to register a service
+	if config.Check == nil {
+		return client.Register(config.Name, addr)
+	}
+
+	var check health.Check
+	switch config.Check.Type {
+	case "tcp":
+		check = &health.TCPCheck{Addr: localAddr}
+	case "http", "https":
+		check = &health.HTTPCheck{
+			URL:        fmt.Sprintf("%s://%s%s", config.Check.Type, localAddr, config.Check.Path),
+			Host:       config.Check.Host,
+			StatusCode: config.Check.Status,
+			MatchBytes: []byte(config.Check.Match),
+		}
+	default:
+		// unsupported checker type
+		return nil, fmt.Errorf("unsupported check type: %s", config.Check.Type)
+	}
+	reg := health.Registration{
+		Registrar: client,
+		Service:   config.Name,
+		Instance: &discoverd.Instance{
+			Addr:  addr,
+			Proto: port.Proto,
+		},
+		Monitor: health.Monitor{
+			Interval:  config.Check.Interval,
+			Threshold: config.Check.Threshold,
+		}.Run,
+		Check: check,
+	}
+
+	if config.Check.KillDown {
+		reg.Events = make(chan health.MonitorEvent)
+		go func() {
+			if config.Check.StartTimeout == 0 {
+				config.Check.StartTimeout = 10
+			}
+
+			start := false
+			lastStatus := health.MonitorStatusDown
+
+			maybeKill := func() {
+				if lastStatus == health.MonitorStatusDown {
+					container.Signal(int(syscall.SIGKILL), &struct{}{})
+				}
+			}
+			go func() {
+				// ignore events for the first StartTimeout interval
+				<-time.After(config.Check.StartTimeout * time.Second)
+				maybeKill() // check if the app is down
+				start = true
+			}()
+
+			for e := range reg.Events {
+				lastStatus = e.Status
+				if !start {
+					continue
+				}
+				maybeKill()
+			}
+		}()
+	}
+	return reg.Register(), nil
+}
+
 func babySit(process *os.Process) int {
 	// Forward all signals to the app
 	sigchan := make(chan os.Signal, 1)
@@ -513,6 +601,18 @@ func containerInitApp(c *Config) error {
 	init.changeState(StateRunning, "", -1)
 
 	init.mtx.Unlock() // Allow calls
+	// monitor services
+	for _, port := range c.Ports {
+		if port.Service == nil {
+			continue
+		}
+		hb, err := monitor(port, init, c.Env)
+		if err != nil {
+			log.Printf("Error trying to monitor: %v", err)
+			shutdown.Fatal(err)
+		}
+		defer hb.Close()
+	}
 	exitCode := babySit(init.process)
 	init.mtx.Lock()
 	init.changeState(StateExited, "", exitCode)
