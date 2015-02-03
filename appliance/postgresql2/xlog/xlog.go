@@ -38,8 +38,12 @@ import (
 	"strings"
 )
 
+type Position string
+
+const Zero Position = "0/00000000"
+
 // Increment increments an xlog position by the given number.
-func Increment(xlog string, increment int) (string, error) {
+func Increment(xlog Position, increment int) (Position, error) {
 	parts, err := parse(xlog)
 	if err != nil {
 		return "", err
@@ -49,7 +53,7 @@ func Increment(xlog string, increment int) (string, error) {
 
 // Compare compares two xlog positions returning -1 if xlog1 < xlog2, 0 if xlog1
 // == xlog2, and 1 if xlog1 > xlog2.
-func Compare(xlog1, xlog2 string) (int, error) {
+func Compare(xlog1, xlog2 Position) (int, error) {
 	p1, err := parse(xlog1)
 	if err != nil {
 		return 0, err
@@ -72,8 +76,8 @@ func Compare(xlog1, xlog2 string) (int, error) {
 // integers representing the filepart and offset components of the xlog
 // position. This is an internal representation that should not be exposed
 // outside of this package.
-func parse(xlog string) (res [2]int, err error) {
-	parts := strings.SplitN(xlog, "/", 2)
+func parse(xlog Position) (res [2]int, err error) {
+	parts := strings.SplitN(string(xlog), "/", 2)
 	if len(parts) != 2 {
 		err = fmt.Errorf("malformed xlog position %q", xlog)
 		return
@@ -90,8 +94,8 @@ func parse(xlog string) (res [2]int, err error) {
 
 // MakePosition constructs an xlog position string from a numeric file part and
 // offset.
-func makePosition(filepart int, offset int) string {
-	return fmt.Sprintf("%X/%08X", filepart, offset)
+func makePosition(filepart int, offset int) Position {
+	return Position(fmt.Sprintf("%X/%08X", filepart, offset))
 }
 
 func parseHex(s string) (int, error) {

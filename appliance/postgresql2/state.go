@@ -17,21 +17,33 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/flynn/flynn/appliance/postgresql2/xlog"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/inconshreveable/log15"
 )
 
 type State struct {
-	Generation int    `json:"generation"`
-	InitWAL    string `json:"init_wal"`
-	Freeze     bool   `json:"freeze,omitempty"`
-	Singleton  bool   `json:"singleton,omitempty"`
+	Generation int                   `json:"generation"`
+	Freeze     *FreezeDetails        `json:"freeze,omitempty"`
+	Singleton  bool                  `json:"singleton,omitempty"`
+	InitWAL    xlog.Position         `json:"init_wal"`
+	Primary    *discoverd.Instance   `json:"primary"`
+	Sync       *discoverd.Instance   `json:"sync"`
+	Async      []*discoverd.Instance `json:"async"`
+	Deposed    []*discoverd.Instance `json:"deposed,omitempty"`
+}
 
-	Primary *discoverd.Instance   `json:"primary"`
-	Sync    *discoverd.Instance   `json:"sync"`
-	Async   []*discoverd.Instance `json:"async"`
-	Deposed []*discoverd.Instance `json:"deposed,omitempty"`
+type FreezeDetails struct {
+	FrozenAt time.Time `json:"frozen_at"`
+	Reason   string    `json:"reason"`
+}
+
+func NewFreezeDetails(reason string) *FreezeDetails {
+	return &FreezeDetails{
+		FrozenAt: time.Now().UTC(),
+		Reason:   reason,
+	}
 }
 
 type Role int
@@ -142,9 +154,9 @@ func (p *Peer) evalClusterState(noRest bool) {
 		if !p.pgSetup &&
 			p.clusterPeers[0].ID == p.id &&
 			(p.singleton || len(p.clusterPeers) > 1) {
-			// TODO this.startInitialSetup()
+			p.startInitialSetup()
 		} else if p.role != RoleUnassigned {
-			// TODO this.assumeUnassigned()
+			p.assumeUnassigned()
 		} else if !noRest {
 			p.rest()
 		}
@@ -170,12 +182,12 @@ func (p *Peer) evalClusterState(noRest bool) {
 
 		if p.role == RolePrimary {
 			if p.clusterState.Primary.ID != p.id {
-				// TODO: this.assumeDeposed()
+				p.assumeDeposed()
 			} else if !noRest {
 				p.rest()
 			}
 		} else {
-			// TODO: this.evalInitClusterState();
+			p.evalInitClusterState()
 		}
 
 		return
@@ -304,10 +316,6 @@ func (p *Peer) evalClusterState(noRest bool) {
 	*/
 }
 
-func (p *Peer) startTakeover() {
-
-}
-
 func (p *Peer) startInitialSetup() {
 	if p.updating {
 		panic("already updating")
@@ -317,5 +325,97 @@ func (p *Peer) startInitialSetup() {
 	}
 
 	p.updating = true
-	p.updatingState = 
+	p.updatingState = &State{
+		Generation: 1,
+		Primary:    p.ident,
+		InitWAL:    xlog.Zero,
+	}
+	if p.singleton {
+		p.updatingState.Singleton = true
+		p.updatingState.Freeze = NewFreezeDetails("cluster started in singleton mode")
+	} else {
+		p.updatingState.Sync = p.clusterPeers[1]
+		p.updatingState.Async = p.clusterPeers[2:]
+	}
+
+	/*
+		this.mp_log.info(peer.mp_updating_state,
+		    'creating initial cluster state');
+		this.mp_zk.putClusterState(this.mp_updating_state, function (err) {
+			peer.mp_updating = false;
+
+			if (err) {
+				err = new VError(err, 'failed to create cluster state');
+				peer.mp_log.warn(err);
+			} else {
+				peer.mp_zkstate = peer.mp_updating_state;
+				peer.mp_log.info('created cluster state');
+			}
+
+			peer.mp_updating_state = null;
+			peer.evalClusterState();
+		});
+	*/
+}
+
+func (p *Peer) assumeUnassigned() {
+	p.log.Info("assuming unassigned role", "role", "unassigned", "fn", "assumeUnassigned")
+	p.role = RoleUnassigned
+	p.pgUpstream = nil
+	// TODO pgApplyConfig()
+}
+
+func (p *Peer) assumeDeposed() {
+	p.log.Info("assuming deposed role", "role", "deposed", "fn", "assumeDeposed")
+	p.role = RoleDeposed
+	p.pgUpstream = nil
+	// TODO pgApplyConfig()
+}
+
+func (p *Peer) assumePrimary() {
+	p.log.Info("assuming primary role", "role", "primary", "fn", "assumeDeposed")
+}
+
+func (p *Peer) evalInitClusterState() {
+	if p.updating {
+		panic("already updating")
+	}
+
+	if p.clusterState.Primary.ID == p.id {
+		// TODO: p.assumePrimary()
+		return
+	}
+	if p.clusterState.Singleton {
+		p.assumeUnassigned()
+		return
+	}
+	if p.clusterState.Sync.ID == p.id {
+		// TODO: p.assumeSync()
+		return
+	}
+
+	for _, d := range p.clusterState.Deposed {
+		if p.id == d.ID {
+			// TODO: p.assumeDeposed()
+			return
+		}
+	}
+
+	// If we're an async, figure out which one we are.
+	if i := p.whichAsync(); i != -1 {
+		// TODO: p.assumeAsync(i)
+		return
+	}
+
+	p.assumeUnassigned()
+}
+
+// Determine our index in the async peer list. -1 means not present.
+func (p *Peer) whichAsync() int {
+	for i, a := range p.clusterState.Async {
+		if p.id == a.ID {
+			return i
+		}
+	}
+	return -1
 }
