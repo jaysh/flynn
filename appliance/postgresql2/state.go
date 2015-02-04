@@ -14,6 +14,7 @@
 package state
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -80,8 +81,9 @@ type Peer struct {
 	updating      bool   // currently updating state
 	updatingState *State // new state object
 
-	clusterState *State                // last received cluster state
-	clusterPeers []*discoverd.Instance // last received list of peers
+	clusterStateIndex uint64                // last known state index from discoverd
+	clusterState      *State                // last received cluster state
+	clusterPeers      []*discoverd.Instance // last received list of peers
 
 	pgOnline        *bool     // nil for unknown
 	pgSetup         bool      // whether db existed at start
@@ -134,8 +136,8 @@ func (p *Peer) evalClusterState(noRest bool) {
 	log := p.log.New(log15.Ctx{"fn": "evalClusterState"})
 	log.Info("starting state evaluation", "at", "start")
 
-	if !p.atRest() {
-		panic("unexpected evalClusterState while already moving")
+	if p.atRest() {
+		panic("evalClusterState when not moving")
 	}
 
 	// Ignore changes to the cluster state while we're in the middle of updating
@@ -196,44 +198,38 @@ func (p *Peer) evalClusterState(noRest bool) {
 	// Unassigned peers and async peers only need to watch their position in the
 	// async peer list and reconfigure themselves as needed
 	if p.role == RoleUnassigned {
-		/*
-			whichasync = this.whichAsync();
-			if (whichasync != -1)
-				this.assumeAsync(whichasync);
-			else if (!norest)
-				this.rest();
-			return;
-		*/
+		if i := p.whichAsync(); i != -1 {
+			p.assumeAsync(i)
+		} else if !noRest {
+			p.rest()
+		}
 	}
 
 	if p.role == RoleAsync {
-		/*
-			whichasync = this.whichAsync();
-			if (whichasync == -1) {
-				this.assumeUnassigned();
-			} else {
-				upstream = this.upstream(whichasync);
-				if (upstream.id != this.mp_pg_upstream.id)
-					this.assumeAsync(whichasync);
-				else if (!norest)
-					this.rest();
+		if whichAsync := p.whichAsync(); whichAsync == -1 {
+			p.assumeUnassigned()
+		} else {
+			upstream := p.upstream(whichAsync)
+			if upstream.ID != p.pgUpstream.ID {
+				p.assumeAsync(whichAsync)
+			} else if !noRest {
+				p.rest()
 			}
-			return;
-		*/
+		}
+		return
 	}
 
 	// The synchronous peer only needs to check the takeover condition, which is
 	// that the primary has disappeared and the sync's WAL has caught up enough
 	// to takeover as primary.
 	if p.role == RoleSync {
-		/*
-			if (!this.peerIsPresent(zkstate.primary))
-				this.startTakeover('primary gone', zkstate.initWal);
-			else if (!norest)
-				this.rest();
+		if !p.peerIsPresent(p.clusterState.Primary) {
+			p.startTakeover("primary gone", p.clusterState.InitWAL)
+		} else if !noRest {
+			p.rest()
+		}
 
-			return;
-		*/
+		return
 	}
 
 	if p.role != RolePrimary {
@@ -245,7 +241,7 @@ func (p *Peer) evalClusterState(noRest bool) {
 		if p.clusterState.Primary.ID != p.id {
 			panic(fmt.Sprintf("unexpected cluster state, we should be the primary, but %s is", p.clusterState.Primary.ID))
 		}
-		// TODO: this.startTransitionToNormalMode()
+		p.startTransitionToNormalMode()
 		return
 	}
 
@@ -267,13 +263,12 @@ func (p *Peer) evalClusterState(noRest bool) {
 	// consider a takeover the next time around. If we update this to handle
 	// both operations at once, we can get rid of the goofy boolean returned by
 	// startTakeover.
+	if !p.peerIsPresent(p.clusterState.Sync) &&
+		p.startTakeover("sync gone", p.clusterState.InitWAL) {
+		return
+	}
 
 	/*
-		if (!this.peerIsPresent(zkstate.sync) &&
-		    this.startTakeover('sync gone')) {
-			return;
-		}
-
 		presentpeers = {};
 		presentpeers[zkstate.primary.id] = true;
 		presentpeers[zkstate.sync.id] = true;
@@ -373,7 +368,53 @@ func (p *Peer) assumeDeposed() {
 }
 
 func (p *Peer) assumePrimary() {
-	p.log.Info("assuming primary role", "role", "primary", "fn", "assumeDeposed")
+	p.log.Info("assuming primary role", "role", "primary", "fn", "assumePrimary")
+	p.role = RolePrimary
+	p.pgUpstream = nil
+
+	// It simplifies things to say that evalClusterState() only deals with one
+	// change at a time. Now that we've handled the change to become primary,
+	// check for other changes.
+	//
+	// For example, we may have just read the initial state that identifies us
+	// as the primary, and we may also discover that the synchronous peer is
+	// not present. The first call to evalClusterState() will get us here, and
+	// we call it again to check for the presence of the synchronous peer.
+	//
+	// We invoke pgApplyConfig() after evalClusterState(), though it may well
+	// turn out that evalClusterState() kicked off an operation that will
+	// change the desired postgres configuration. In that case, we'll end up
+	// calling pgApplyConfig() again.
+	p.evalClusterState(true)
+	// TODO: pgApplyConfig()
+}
+
+func (p *Peer) assumeSync() {
+	if p.singleton {
+		panic("assumeSync as singleton")
+	}
+	p.log.Info("assuming sync role", "role", "sync", "fn", "assumeSync")
+
+	p.role = RolePrimary
+	p.pgUpstream = p.clusterState.Primary
+	// See assumePrimary()
+	p.evalClusterState(true)
+	// TODO: pgApplyConfig()
+}
+
+func (p *Peer) assumeAsync(i int) {
+	if p.singleton {
+		panic("assumeAsync as singleton")
+	}
+	p.log.Info("assuming sync role", "role", "async", "fn", "assumeAsync")
+
+	p.role = RoleAsync
+	p.pgUpstream = p.upstream(i)
+
+	// See assumePrimary(). We don't need to check the cluster state here
+	// because there's never more than one thing to do when becoming the async
+	// peer.
+	// TODO: pgApplyConfig()
 }
 
 func (p *Peer) evalInitClusterState() {
@@ -382,7 +423,7 @@ func (p *Peer) evalInitClusterState() {
 	}
 
 	if p.clusterState.Primary.ID == p.id {
-		// TODO: p.assumePrimary()
+		p.assumePrimary()
 		return
 	}
 	if p.clusterState.Singleton {
@@ -390,24 +431,234 @@ func (p *Peer) evalInitClusterState() {
 		return
 	}
 	if p.clusterState.Sync.ID == p.id {
-		// TODO: p.assumeSync()
+		p.assumeSync()
 		return
 	}
 
 	for _, d := range p.clusterState.Deposed {
 		if p.id == d.ID {
-			// TODO: p.assumeDeposed()
+			p.assumeDeposed()
 			return
 		}
 	}
 
 	// If we're an async, figure out which one we are.
 	if i := p.whichAsync(); i != -1 {
-		// TODO: p.assumeAsync(i)
+		p.assumeAsync(i)
 		return
 	}
 
 	p.assumeUnassigned()
+}
+
+func (p *Peer) startTakeover(reason string, minWAL xlog.Position) bool {
+	log := p.log.New(log15.Ctx{"fn": "startTakeover", "reason": reason, "min_wal": minWAL})
+
+	// Select the first present async peer to be the next sync
+	var newSync *discoverd.Instance
+	for _, a := range p.clusterState.Async {
+		if p.peerIsPresent(a) {
+			newSync = a
+			break
+		}
+	}
+	if newSync == nil {
+		log.Warn("would takeover but no async peers present", "at", "no_async")
+		return false
+	}
+
+	log.Debug("preparing for new generation", "at", "prepare")
+	newAsync := make([]*discoverd.Instance, 0, len(p.clusterState.Async))
+	for _, a := range p.clusterState.Async {
+		if a.ID != newSync.ID && p.peerIsPresent(a) {
+			newAsync = append(newAsync, a)
+		}
+	}
+
+	var newDeposed []*discoverd.Instance
+	if p.clusterState.Primary.ID != p.id {
+		newDeposed = make([]*discoverd.Instance, 0, len(p.clusterState.Deposed)+1)
+		newDeposed = append(newDeposed, p.clusterState.Deposed...)
+	} else {
+		newDeposed = p.clusterState.Deposed
+	}
+
+	p.startTakeoverWithPeer(reason, minWAL, &State{
+		Sync:    newSync,
+		Async:   newAsync,
+		Deposed: newDeposed,
+	})
+	return true
+
+}
+
+func (p *Peer) startTakeoverWithPeer(reason string, minWAL xlog.Position, newState *State) {
+	log := p.log.New(log15.Ctx{"fn": "startTakeoverWithPeer", "reason": reason, "min_wal": minWAL})
+	log.Info("starting takeover")
+
+	if p.atRest() {
+		panic("startTakeoverWithPeer while at rest")
+	}
+
+	// p.updating acts as a guard to prevent us from trying to make any other
+	// changes while we're trying to write the new cluster state. If any state
+	// change comes in while this is ongoing, we'll just record it and examine
+	// it after this operation has completed (successfully or not).
+	if p.updating {
+		panic("startTakeoverWithPeer while already updating")
+	}
+	if p.updatingState != nil {
+		panic("startTakeoverWithPeer with non-nil updatingState")
+	}
+	p.updating = true
+	newState.Generation = p.clusterState.Generation + 1
+	newState.Primary = p.ident
+	p.updatingState = newState
+
+	if p.updatingState.Primary.ID != p.clusterState.Primary.ID && len(p.updatingState.Deposed) == 0 {
+		panic("startTakeoverWithPeer without deposing old primary")
+	}
+
+	/*
+		mod_vasync.waterfall([
+		    function takeoverCheckFrozen(callback) {
+			/*
+			 * We could have checked this above, but we want to take
+			 * advantage of the code below that backs off for a second or
+			 * two in this case and keeps mp_updating set.
+			 *
+			if (peer.mp_zkstate.freeze &&
+			    peer.mp_zkstate.freeze !== null &&
+			    peer.mp_zkstate.freeze !== false) {
+				var err = new VError('cluster is frozen');
+				err.name = 'ClusterFrozenError';
+				callback(err);
+			} else {
+				callback();
+			}
+		    },
+		    function takeoverFetchXlog(callback) {
+			/*
+			 * In order to declare a new generation, we'll need to fetch our
+			 * current transaction log position, which requires that postres
+			 * be online.  In most cases, it will be, since we only declare
+			 * a new generation as a primary or a caught-up sync.  During
+			 * initial startup, however, we may find out simultaneously that
+			 * we're the primary or sync AND that the other is gone, so we
+			 * may attempt to declare a new generation before we've started
+			 * postgres.  In this case, this step will fail, but we'll just
+			 * skip the takeover attempt until postgres is running.
+			 * (Postgres coming online will trigger another check of the
+			 * cluster state that will trigger us to issue another takeover
+			 * if appropriate.)
+			 *
+			if (!peer.mp_pg_online || peer.mp_pg_transitioning) {
+				var err = new VError('postgres is offline');
+				err.name = 'PostgresOfflineError';
+				callback(err);
+			} else {
+				peer.mp_pg.getXLogLocation(callback);
+			}
+		    },
+		    function takeoverWriteState(wal, callback) {
+			var error;
+
+			if (minwal !== undefined &&
+			    mod_xlog.xlogCompare(wal, minwal) < 0) {
+				var err = new VError('would attempt takeover, but ' +
+				    'not caught up to primary yet (want "%s", ' +
+				    'found "%s"', minwal, wal);
+				err.name = 'PeerNotCaughtUpError';
+				callback(err);
+				return;
+			}
+
+			peer.mp_updating_state.initWal = wal;
+			error = mod_validation.validateZkState(peer.mp_updating_state);
+			if (error instanceof Error)
+				peer.fatal(error);
+			peer.mp_log.info(peer.mp_updating_state,
+			    'declaring new generation (%s)', reason);
+			peer.mp_zk.putClusterState(
+			    peer.mp_updating_state, callback);
+		    }
+		], function (err) {
+			mod_assertplus.ok(!peer.atRest());
+
+			/*
+			 * In the event of an error, back off a bit and check state
+			 * again in a few seconds.  There are several transient failure
+			 * modes that will resolve themselves (e.g., postgres not yet
+			 * online, postgres synchronous replication not yet caught up).
+			 *
+			if (err) {
+				if (err.name == 'PeerNotCaughtUpError' ||
+				    err.name == 'PostgresOfflineError' ||
+				    err.name == 'ClusterFrozenError') {
+					peer.mp_log.warn(err, 'backing off');
+				} else {
+					err = new VError('failed to declare ' +
+					    'new generation');
+					peer.mp_log.error(err, 'backing off');
+				}
+
+				setTimeout(function () {
+					peer.moving();
+					peer.mp_updating = false;
+					peer.mp_updating_state = null;
+					peer.evalClusterState();
+				}, 1000);
+
+				return;
+			}
+
+			peer.mp_zkstate = peer.mp_updating_state;
+			peer.mp_updating_state = null;
+			peer.mp_updating = false;
+			peer.mp_gen = peer.mp_zkstate.generation;
+			peer.mp_log.info('declared new generation');
+
+			/*
+			 * assumePrimary() calls evalClusterState() to catch any
+			 * changes we missed while we were updating.
+			 *
+			peer.assumePrimary();
+		});
+	*/
+}
+
+// As the primary, converts the current cluster to normal mode from singleton
+// mode.
+func (p *Peer) startTransitionToNormalMode() {
+	log := p.log.New(log15.Ctx{"fn": "startTransitionToNormalMode"})
+	if p.clusterState.Primary.ID != p.id || p.role != RolePrimary {
+		panic("startTransitionToNormalMode called when not primary")
+	}
+
+	// In the normal takeover case, we'd pick an async. In this case, we take
+	// any other peer because we know none of them has anything replicated.
+	var newSync *discoverd.Instance
+	for _, peer := range p.clusterPeers {
+		if peer.ID != p.id {
+			newSync = peer
+		}
+	}
+	if newSync == nil {
+		log.Warn("would takeover but no peers present", "at", "no_sync")
+		return
+	}
+	newAsync := make([]*discoverd.Instance, 0, len(p.clusterPeers))
+	for _, a := range p.clusterPeers {
+		if a.ID != p.id && a.ID != newSync.ID {
+			newAsync = append(newAsync, a)
+		}
+	}
+
+	log.Debug("transitioning to normal mode", "at", "takeover")
+	p.startTakeoverWithPeer("transitioning to normal mode", xlog.Zero, &State{
+		Sync:  newSync,
+		Async: newAsync,
+	})
 }
 
 // Determine our index in the async peer list. -1 means not present.
@@ -418,4 +669,44 @@ func (p *Peer) whichAsync() int {
 		}
 	}
 	return -1
+}
+
+// Return the upstream peer for a given one of the async peers
+func (p *Peer) upstream(whichAsync int) *discoverd.Instance {
+	if whichAsync == 0 {
+		return p.clusterState.Sync
+	}
+	return p.clusterState.Async[whichAsync-1]
+}
+
+// Returns true if the given other peer appears to be present in the most
+// recently received list of present peers.
+func (p *Peer) peerIsPresent(other *discoverd.Instance) bool {
+	// We should never even be asking whether we're present.  If we need to
+	// do this at some point in the future, we need to consider we should
+	// always consider ourselves present or whether we should check the
+	// list.
+	if other.ID == p.id {
+		panic("peerIsPresent with self")
+	}
+	for _, p := range p.clusterPeers {
+		if p.ID == other.ID {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (p *Peer) putClusterState() error {
+	data, _ := json.Marshal(p.updatingState)
+	meta := &discoverd.ServiceMeta{
+		Data:  data,
+		Index: p.clusterStateIndex,
+	}
+	if err := p.discoverd.SetServiceMeta(meta); err != nil {
+		return err
+	}
+	p.clusterStateIndex = meta.Index
+	return nil
 }
