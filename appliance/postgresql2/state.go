@@ -15,6 +15,7 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -64,6 +65,13 @@ type PgConfig struct {
 	Downstream *discoverd.Instance
 }
 
+type Postgres interface {
+	XLogPosition() (xlog.Position, error)
+	Reconfigure(*PgConfig) error
+	Start() error
+	Stop() error
+}
+
 type Peer struct {
 	// Configuration
 	id        string
@@ -73,7 +81,7 @@ type Peer struct {
 	// External Interfaces
 	log       log15.Logger
 	discoverd discoverd.Service
-	postgres  interface{}
+	postgres  Postgres
 
 	// Dynamic state
 	role          Role   // current role
@@ -94,6 +102,20 @@ type Peer struct {
 	pgUpstream      *discoverd.Instance // upstream replication target
 
 	movingAt *time.Time
+
+	// tick is used to trigger a state evaluation, usually in the future after
+	// an error
+	tick chan struct{}
+}
+
+func (p *Peer) Run() {
+	for {
+		select {
+		// discoverd events
+		// postgres events
+		case <-p.tick:
+		}
+	}
 }
 
 func (p *Peer) moving() {
@@ -125,7 +147,7 @@ func (p *Peer) atRest() bool {
 	return p.movingAt == nil
 }
 
-// Examine the current ZK cluster state and determine if new actions need to be
+// Examine the current cluster state and determine if new actions need to be
 // taken.  For example, if we're the primary, and there's no sync present, then
 // we need to declare a new generation.
 //
@@ -166,8 +188,7 @@ func (p *Peer) evalClusterState(noRest bool) {
 		return
 	}
 
-	// Bail out if we're configured for one-node-write mode but the cluster is
-	// not.
+	// Bail out if we're configured for singleton mode but the cluster is not.
 	if p.singleton && !p.clusterState.Singleton {
 		shutdown.Fatal("configured for singleton mode but cluster found in normal mode")
 		return
@@ -268,47 +289,45 @@ func (p *Peer) evalClusterState(noRest bool) {
 		return
 	}
 
-	/*
-		presentpeers = {};
-		presentpeers[zkstate.primary.id] = true;
-		presentpeers[zkstate.sync.id] = true;
-		newpeers = [];
-		nchanges = 0;
-		for (i = 0; i < zkstate.async.length; i++) {
-			if (this.peerIsPresent(zkstate.async[i])) {
-				presentpeers[zkstate.async[i].id] = true;
-				newpeers.push(zkstate.async[i]);
-			} else {
-				this.mp_log.debug(zkstate.async[i], 'peer missing');
-				nchanges++;
-			}
+	presentPeers := make(map[string]struct{}, len(p.clusterPeers))
+	presentPeers[p.clusterState.Primary.ID] = struct{}{}
+	presentPeers[p.clusterState.Sync.ID] = struct{}{}
+
+	newAsync := make([]*discoverd.Instance, 0, len(p.clusterPeers))
+	changes := false
+
+	for _, a := range p.clusterState.Async {
+		if p.peerIsPresent(a) {
+			presentPeers[a.ID] = struct{}{}
+			newAsync = append(newAsync, a)
+		} else {
+			log.Debug("peer missing", "at", "missing_async", "async.id", a.ID, "async.addr", a.Addr)
+			changes = true
 		}
+	}
 
-		/*
-		 * Deposed peers should not be assigned as asyncs.
-		 *
-		for (i = 0; i < zkstate.deposed.length; i++)
-			presentpeers[zkstate.deposed[i].id] = true;
+	// Deposed peers should not be assigned as asyncs
+	for _, d := range p.clusterState.Deposed {
+		presentPeers[d.ID] = struct{}{}
+	}
 
-		for (i = 0; i < this.mp_zkpeers.length; i++) {
-			if (presentpeers.hasOwnProperty(this.mp_zkpeers[i].id))
-				continue;
-
-			this.mp_log.debug(this.mp_zkpeers[i], 'new peer found');
-			newpeers.push(this.mp_zkpeers[i]);
-			nchanges++;
+	for _, peer := range p.clusterPeers {
+		if _, ok := presentPeers[peer.ID]; ok {
+			continue
 		}
+		log.Debug("new peer", "at", "add_async", "async.id", peer.ID, "async.addr", peer.Addr)
+		newAsync = append(newAsync, peer)
+		changes = true
+	}
 
-		if (nchanges === 0) {
-			mod_assertplus.deepEqual(newpeers, zkstate.async);
-			if (!norest)
-				this.rest();
-			return;
+	if !changes {
+		if !noRest {
+			p.rest()
 		}
+		return
+	}
 
-		this.startUpdateAsyncs(newpeers);
-
-	*/
+	p.startUpdateAsyncs(newAsync)
 }
 
 func (p *Peer) startInitialSetup() {
@@ -332,25 +351,18 @@ func (p *Peer) startInitialSetup() {
 		p.updatingState.Sync = p.clusterPeers[1]
 		p.updatingState.Async = p.clusterPeers[2:]
 	}
+	log := p.log.New(log15.Ctx{"fn": "startInitialSetup"})
+	log.Info("creating initial cluster state", "generation", 1, "at", "create_state")
 
-	/*
-		this.mp_log.info(peer.mp_updating_state,
-		    'creating initial cluster state');
-		this.mp_zk.putClusterState(this.mp_updating_state, function (err) {
-			peer.mp_updating = false;
+	if err := p.putClusterState(); err != nil {
+		log.Warn("failed to create cluster state", "at", "create_state", "err", err)
+	} else {
+		p.clusterState = p.updatingState
+	}
+	p.updating = false
+	p.updatingState = nil
 
-			if (err) {
-				err = new VError(err, 'failed to create cluster state');
-				peer.mp_log.warn(err);
-			} else {
-				peer.mp_zkstate = peer.mp_updating_state;
-				peer.mp_log.info('created cluster state');
-			}
-
-			peer.mp_updating_state = null;
-			peer.evalClusterState();
-		});
-	*/
+	go p.sendTick()
 }
 
 func (p *Peer) assumeUnassigned() {
@@ -489,10 +501,15 @@ func (p *Peer) startTakeover(reason string, minWAL xlog.Position) bool {
 		Deposed: newDeposed,
 	})
 	return true
-
 }
 
-func (p *Peer) startTakeoverWithPeer(reason string, minWAL xlog.Position, newState *State) {
+var (
+	ErrClusterFrozen   = errors.New("cluster is frozen")
+	ErrPostgresOffline = errors.New("postgres is offline")
+	ErrPeerNotCaughtUp = errors.New("peer is not caught up")
+)
+
+func (p *Peer) startTakeoverWithPeer(reason string, minWAL xlog.Position, newState *State) (err error) {
 	log := p.log.New(log15.Ctx{"fn": "startTakeoverWithPeer", "reason": reason, "min_wal": minWAL})
 	log.Info("starting takeover")
 
@@ -519,112 +536,73 @@ func (p *Peer) startTakeoverWithPeer(reason string, minWAL xlog.Position, newSta
 		panic("startTakeoverWithPeer without deposing old primary")
 	}
 
-	/*
-		mod_vasync.waterfall([
-		    function takeoverCheckFrozen(callback) {
-			/*
-			 * We could have checked this above, but we want to take
-			 * advantage of the code below that backs off for a second or
-			 * two in this case and keeps mp_updating set.
-			 *
-			if (peer.mp_zkstate.freeze &&
-			    peer.mp_zkstate.freeze !== null &&
-			    peer.mp_zkstate.freeze !== false) {
-				var err = new VError('cluster is frozen');
-				err.name = 'ClusterFrozenError';
-				callback(err);
-			} else {
-				callback();
-			}
-		    },
-		    function takeoverFetchXlog(callback) {
-			/*
-			 * In order to declare a new generation, we'll need to fetch our
-			 * current transaction log position, which requires that postres
-			 * be online.  In most cases, it will be, since we only declare
-			 * a new generation as a primary or a caught-up sync.  During
-			 * initial startup, however, we may find out simultaneously that
-			 * we're the primary or sync AND that the other is gone, so we
-			 * may attempt to declare a new generation before we've started
-			 * postgres.  In this case, this step will fail, but we'll just
-			 * skip the takeover attempt until postgres is running.
-			 * (Postgres coming online will trigger another check of the
-			 * cluster state that will trigger us to issue another takeover
-			 * if appropriate.)
-			 *
-			if (!peer.mp_pg_online || peer.mp_pg_transitioning) {
-				var err = new VError('postgres is offline');
-				err.name = 'PostgresOfflineError';
-				callback(err);
-			} else {
-				peer.mp_pg.getXLogLocation(callback);
-			}
-		    },
-		    function takeoverWriteState(wal, callback) {
-			var error;
+	defer func() {
+		if err == nil {
+			return
+		}
+		p.updating = false
+		p.updatingState = nil
+		// In the event of an error, back off a bit and check state again in
+		// a second. There are several transient failure modes that will resolve
+		// themselves (e.g., postgres not yet online, postgres synchronous
+		// replication not yet caught up).
+		log.Warn("failed to declare new generation, backing off", "err", err)
+		p.evalLater(1 * time.Second)
+	}()
 
-			if (minwal !== undefined &&
-			    mod_xlog.xlogCompare(wal, minwal) < 0) {
-				var err = new VError('would attempt takeover, but ' +
-				    'not caught up to primary yet (want "%s", ' +
-				    'found "%s"', minwal, wal);
-				err.name = 'PeerNotCaughtUpError';
-				callback(err);
-				return;
-			}
+	if p.clusterState.Freeze != nil {
+		return ErrClusterFrozen
+	}
 
-			peer.mp_updating_state.initWal = wal;
-			error = mod_validation.validateZkState(peer.mp_updating_state);
-			if (error instanceof Error)
-				peer.fatal(error);
-			peer.mp_log.info(peer.mp_updating_state,
-			    'declaring new generation (%s)', reason);
-			peer.mp_zk.putClusterState(
-			    peer.mp_updating_state, callback);
-		    }
-		], function (err) {
-			mod_assertplus.ok(!peer.atRest());
+	// In order to declare a new generation, we'll need to fetch our current
+	// transaction log position, which requires that postres be online. In most
+	// cases, it will be, since we only declare a new generation as a primary or
+	// a caught-up sync. During initial startup, however, we may find out
+	// simultaneously that we're the primary or sync AND that the other is gone,
+	// so we may attempt to declare a new generation before we've started
+	// postgres. In this case, this step will fail, but we'll just skip the
+	// takeover attempt until postgres is running. (Postgres coming online will
+	// trigger another check of the cluster state that will trigger us to issue
+	// another takeover if appropriate.)
+	if !*p.pgOnline || p.pgTransitioning {
+		return ErrPostgresOffline
+	}
+	wal, err := p.postgres.XLogPosition()
+	if err != nil {
+		return err
+	}
+	if x, err := xlog.Compare(wal, minWAL); err != nil || x < 0 {
+		if err == nil {
+			log.Warn("would attempt takeover but not caught up with primary yet",
+				"at", "check_xlog",
+				"want_wal", minWAL,
+				"found_wal", wal,
+			)
+			err = ErrPeerNotCaughtUp
+		}
+		return err
+	}
+	p.updatingState.InitWAL = wal
+	log.Info("declaring new generation")
 
-			/*
-			 * In the event of an error, back off a bit and check state
-			 * again in a few seconds.  There are several transient failure
-			 * modes that will resolve themselves (e.g., postgres not yet
-			 * online, postgres synchronous replication not yet caught up).
-			 *
-			if (err) {
-				if (err.name == 'PeerNotCaughtUpError' ||
-				    err.name == 'PostgresOfflineError' ||
-				    err.name == 'ClusterFrozenError') {
-					peer.mp_log.warn(err, 'backing off');
-				} else {
-					err = new VError('failed to declare ' +
-					    'new generation');
-					peer.mp_log.error(err, 'backing off');
-				}
+	if err := p.putClusterState(); err != nil {
+		return err
+	}
 
-				setTimeout(function () {
-					peer.moving();
-					peer.mp_updating = false;
-					peer.mp_updating_state = null;
-					peer.evalClusterState();
-				}, 1000);
+	p.clusterState = p.updatingState
+	p.updating = false
+	p.updatingState = nil
+	p.generation = p.clusterState.Generation
+	log.Info("declared new generation",
+		"at", "declared_generation",
+		"generation", p.clusterState.Generation,
+	)
 
-				return;
-			}
+	// assumePrimary() calls evalClusterState() to catch any
+	// changes we missed while we were updating.
+	p.assumePrimary()
 
-			peer.mp_zkstate = peer.mp_updating_state;
-			peer.mp_updating_state = null;
-			peer.mp_updating = false;
-			peer.mp_gen = peer.mp_zkstate.generation;
-			peer.mp_log.info('declared new generation');
-
-			/*
-			 * assumePrimary() calls evalClusterState() to catch any
-			 * changes we missed while we were updating.
-			 *
-			peer.assumePrimary();
-		});
-	*/
+	return nil
 }
 
 // As the primary, converts the current cluster to normal mode from singleton
@@ -659,6 +637,37 @@ func (p *Peer) startTransitionToNormalMode() {
 		Sync:  newSync,
 		Async: newAsync,
 	})
+}
+
+func (p *Peer) startUpdateAsyncs(newAsync []*discoverd.Instance) {
+	if p.updating {
+		panic("startUpdateAsyncs while already updating")
+	}
+	if p.updatingState != nil {
+		panic("startUpdateAsyncs with existing update state")
+	}
+	log := p.log.New(log15.Ctx{"fn": "startUpdateAsyncs"})
+
+	p.updating = true
+	p.updatingState = &State{
+		Generation: p.clusterState.Generation,
+		Primary:    p.clusterState.Primary,
+		Sync:       p.clusterState.Sync,
+		Async:      newAsync,
+		Deposed:    p.clusterState.Deposed,
+		InitWAL:    p.clusterState.InitWAL,
+	}
+	log.Info("updating list of asyncs", "at", "update_state")
+	err := p.putClusterState()
+	if err != nil {
+		log.Warn("failed to update cluster state", "err", err, "at", "update_state")
+	} else {
+		p.clusterState = p.updatingState
+	}
+	p.updating = false
+	p.updatingState = nil
+
+	go p.sendTick()
 }
 
 // Determine our index in the async peer list. -1 means not present.
@@ -704,9 +713,20 @@ func (p *Peer) putClusterState() error {
 		Data:  data,
 		Index: p.clusterStateIndex,
 	}
-	if err := p.discoverd.SetServiceMeta(meta); err != nil {
+	if err := p.discoverd.SetMeta(meta); err != nil {
 		return err
 	}
 	p.clusterStateIndex = meta.Index
 	return nil
+}
+
+// evalLater triggers a cluster state evaluation after delay has elapsed
+func (p *Peer) evalLater(delay time.Duration) {
+	time.AfterFunc(delay, p.sendTick)
+}
+
+// sendTick triggers a cluster state evaluation, it is usually called from
+// a goroutine
+func (p *Peer) sendTick() {
+	p.tick <- struct{}{}
 }
