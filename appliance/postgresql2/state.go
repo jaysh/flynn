@@ -681,7 +681,7 @@ func (p *Peer) startUpdateAsyncs(newAsync []*discoverd.Instance) {
 // cluster state changes will be recorded but otherwise ignored. When
 // reconfiguration completes, if the desired configuration has changed, we'll
 // take another lap to apply the updated configuration.
-func (p *Peer) pgApplyConfig() {
+func (p *Peer) pgApplyConfig() error {
 	log := p.log.New(log15.Ctx{"fn": "pgApplyConfig"})
 	p.moving()
 
@@ -701,78 +701,65 @@ func (p *Peer) pgApplyConfig() {
 
 	p.pgTransitioning = true
 
+	defer func() {
+		// handle error
+		/*
+			 * This is a very unexpected error, and it's very
+			 * unclear how to deal with it.  If we're the primary or
+			 * sync, we might be tempted to abdicate our position.
+			 * But without understanding the failure mode, there's
+			 * no reason to believe any other peer is in a better
+			 * position to deal with this, and we don't want to flap
+			 * unnecessarily.  So just log an error and try again
+			 * shortly.
+			 *
+			err = new VError(err, 'applying pg config');
+			peer.mp_log.error(err);
+			peer.mp_pg_retrypending = new Date();
+			setTimeout(function retryPgApplyConfig() {
+				peer.pgApplyConfig();
+			}, 1000);
+			return;
+		*/
+	}()
+
 	log.Info("reconfiguring postgres")
+	if err := p.postgres.Reconfigure(config); err != nil {
+		return err
+	}
+
+	if config.Role != RoleNone {
+		if *p.pgOnline {
+			log.Debug("skipping start, already online", "at", "skip_start")
+		} else {
+			log.Debug("starting postgres", "at", "start")
+			if err := p.postgres.Start(); err != nil {
+				return err
+			}
+		}
+	} else {
+		if *p.pgOnline {
+			log.Debug("stopping postgres", "at", "stop")
+			if err := p.postgres.Stop(); err != nil {
+				return err
+			}
+		} else {
+			log.Debug("skipping stop, already offline", "at", "skip_stop")
+		}
+	}
+	p.pgTransitioning = false
 
 	/*
-				peer.mp_log.debug('pg.reconfigure', config);
-				peer.mp_pg.reconfigure(config,
-				    function (err) { callback(err); });
-			    },
-
-			    function pgMaybeStartStop(callback) {
-				var expected = config.role != 'none';
-				var actual = peer.mp_pg_online;
-
-				if (expected) {
-					if (actual) {
-						peer.mp_log.debug('pg: skipping enable ' +
-						    '(already online)');
-						callback();
-					} else {
-						peer.mp_log.debug('pg: enabling');
-						peer.mp_pg.start(callback);
-					}
-				} else {
-					if (!actual) {
-						peer.mp_log.debug('pg: skipping disable ' +
-						    '(already offline)');
-						callback();
-					} else {
-						peer.mp_log.debug('pg: disabling');
-						peer.mp_pg.stop(callback);
-					}
-				}
-			    }
-			], function finishPgApply(err) {
-				peer.mp_pg_transitioning = false;
-
-				if (err) {
-					/*
-					 * This is a very unexpected error, and it's very
-					 * unclear how to deal with it.  If we're the primary or
-					 * sync, we might be tempted to abdicate our position.
-					 * But without understanding the failure mode, there's
-					 * no reason to believe any other peer is in a better
-					 * position to deal with this, and we don't want to flap
-					 * unnecessarily.  So just log an error and try again
-					 * shortly.
-					 *
-					err = new VError(err, 'applying pg config');
-					peer.mp_log.error(err);
-					peer.mp_pg_retrypending = new Date();
-					setTimeout(function retryPgApplyConfig() {
-						peer.pgApplyConfig();
-					}, 1000);
-					return;
-				}
-
-				peer.mp_log.info({ 'nretries': peer.mp_pg_nretries },
-				    'pg: applied config', config);
-				peer.mp_pg_nretries = 0;
-				peer.mp_pg_retrypending = null;
-				peer.mp_pg_applied = config;
-				if (config.role != 'none')
-					peer.mp_pg_online = true;
-				else
-					peer.mp_pg_online = false;
-
-				/*
-				 * Try applying the configuration again in case anything's
-				 * changed.  If not, this will be a no-op.
-				 *
-				peer.pgApplyConfig();
-			});
+		peer.mp_log.info({ 'nretries': peer.mp_pg_nretries },
+		    'pg: applied config', config);
 	*/
+	p.pgRetryPending = nil
+	p.pgApplied = config
+	p.pgOnline = config.Role != RoleNone
+
+	// Try applying the configuration again in case anything's
+	// changed.  If not, this will be a no-op.
+	p.pgApplyConfig()
 }
 
 func (p *Peer) pgConfig() *PgConfig {
