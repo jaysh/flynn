@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/flynn/flynn/appliance/postgresql2/xlog"
@@ -57,12 +58,17 @@ const (
 	RoleAsync
 	RoleUnassigned
 	RoleDeposed
+	RoleNone
 )
 
 type PgConfig struct {
 	Role       Role
 	Upstream   *discoverd.Instance
 	Downstream *discoverd.Instance
+}
+
+func (x *PgConfig) Equal(y *PgConfig) bool {
+	return reflect.DeepEqual(x, y)
 }
 
 type Postgres interface {
@@ -668,6 +674,118 @@ func (p *Peer) startUpdateAsyncs(newAsync []*discoverd.Instance) {
 	p.updatingState = nil
 
 	go p.sendTick()
+}
+
+// Reconfigure postgres based on the current configuration. During
+// reconfiguration, new requests to reconfigure will be ignored, and incoming
+// cluster state changes will be recorded but otherwise ignored. When
+// reconfiguration completes, if the desired configuration has changed, we'll
+// take another lap to apply the updated configuration.
+func (p *Peer) pgApplyConfig() {
+	log := p.log.New(log15.Ctx{"fn": "pgApplyConfig"})
+	p.moving()
+
+	if p.pgOnline == nil {
+		panic("pgApplyConfig with postgres in unknown state")
+	}
+	if p.pgTransitioning {
+		log.Info("skipping config apply, already transitioning", "at", "skip")
+		return
+	}
+
+	config := p.pgConfig()
+	if p.pgApplied != nil && p.pgApplied.Equal(config) {
+		log.Info("skipping config apply, no changes", "at", "skip")
+		return
+	}
+
+	p.pgTransitioning = true
+
+	log.Info("reconfiguring postgres")
+
+	/*
+				peer.mp_log.debug('pg.reconfigure', config);
+				peer.mp_pg.reconfigure(config,
+				    function (err) { callback(err); });
+			    },
+
+			    function pgMaybeStartStop(callback) {
+				var expected = config.role != 'none';
+				var actual = peer.mp_pg_online;
+
+				if (expected) {
+					if (actual) {
+						peer.mp_log.debug('pg: skipping enable ' +
+						    '(already online)');
+						callback();
+					} else {
+						peer.mp_log.debug('pg: enabling');
+						peer.mp_pg.start(callback);
+					}
+				} else {
+					if (!actual) {
+						peer.mp_log.debug('pg: skipping disable ' +
+						    '(already offline)');
+						callback();
+					} else {
+						peer.mp_log.debug('pg: disabling');
+						peer.mp_pg.stop(callback);
+					}
+				}
+			    }
+			], function finishPgApply(err) {
+				peer.mp_pg_transitioning = false;
+
+				if (err) {
+					/*
+					 * This is a very unexpected error, and it's very
+					 * unclear how to deal with it.  If we're the primary or
+					 * sync, we might be tempted to abdicate our position.
+					 * But without understanding the failure mode, there's
+					 * no reason to believe any other peer is in a better
+					 * position to deal with this, and we don't want to flap
+					 * unnecessarily.  So just log an error and try again
+					 * shortly.
+					 *
+					err = new VError(err, 'applying pg config');
+					peer.mp_log.error(err);
+					peer.mp_pg_retrypending = new Date();
+					setTimeout(function retryPgApplyConfig() {
+						peer.pgApplyConfig();
+					}, 1000);
+					return;
+				}
+
+				peer.mp_log.info({ 'nretries': peer.mp_pg_nretries },
+				    'pg: applied config', config);
+				peer.mp_pg_nretries = 0;
+				peer.mp_pg_retrypending = null;
+				peer.mp_pg_applied = config;
+				if (config.role != 'none')
+					peer.mp_pg_online = true;
+				else
+					peer.mp_pg_online = false;
+
+				/*
+				 * Try applying the configuration again in case anything's
+				 * changed.  If not, this will be a no-op.
+				 *
+				peer.pgApplyConfig();
+			});
+	*/
+}
+
+func (p *Peer) pgConfig() *PgConfig {
+	switch p.role {
+	case RolePrimary:
+		return &PgConfig{Role: p.role, Downstream: p.clusterState.Sync}
+	case RoleSync, RoleAsync:
+		return &PgConfig{Role: p.role, Upstream: p.pgUpstream}
+	case RoleUnassigned, RoleDeposed:
+		return &PgConfig{Role: RoleNone}
+	default:
+		panic(fmt.Sprintf("unexpected role %v", p.role))
+	}
 }
 
 // Determine our index in the async peer list. -1 means not present.
