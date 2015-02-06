@@ -690,13 +690,13 @@ func (p *Peer) pgApplyConfig() error {
 	}
 	if p.pgTransitioning {
 		log.Info("skipping config apply, already transitioning", "at", "skip")
-		return
+		return nil
 	}
 
 	config := p.pgConfig()
 	if p.pgApplied != nil && p.pgApplied.Equal(config) {
 		log.Info("skipping config apply, no changes", "at", "skip")
-		return
+		return nil
 	}
 
 	p.pgTransitioning = true
@@ -704,15 +704,15 @@ func (p *Peer) pgApplyConfig() error {
 	defer func() {
 		// handle error
 		/*
-			 * This is a very unexpected error, and it's very
-			 * unclear how to deal with it.  If we're the primary or
-			 * sync, we might be tempted to abdicate our position.
-			 * But without understanding the failure mode, there's
-			 * no reason to believe any other peer is in a better
-			 * position to deal with this, and we don't want to flap
-			 * unnecessarily.  So just log an error and try again
-			 * shortly.
-			 *
+			 // This is a very unexpected error, and it's very
+			 // unclear how to deal with it. If we're the primary or
+			 // sync, we might be tempted to abdicate our position.
+			 // But without understanding the failure mode, there's
+			 // no reason to believe any other peer is in a better
+			 // position to deal with this, and we don't want to flap
+			 // unnecessarily. So just log an error and try again
+			 // shortly.
+			 //
 			err = new VError(err, 'applying pg config');
 			peer.mp_log.error(err);
 			peer.mp_pg_retrypending = new Date();
