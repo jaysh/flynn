@@ -76,6 +76,34 @@ type Postgres interface {
 	Reconfigure(*PgConfig) error
 	Start() error
 	Stop() error
+
+	// Events returns a channel that returns a single event when the interface
+	// is ready.
+	Events() <-chan PostgresEvent
+}
+
+type Discoverd interface {
+	SetMeta(*discoverd.ServiceMeta) error
+	Events() <-chan *DiscoverdEvent
+}
+
+type PostgresEvent struct {
+	Online bool
+	Setup  bool
+}
+
+type DiscoverdEventKind int
+
+const (
+	DiscoverdEventInit DiscoverdEventKind = iota
+	DiscoverdEventState
+	DiscoverdEventPeers
+)
+
+type DiscoverdEvent struct {
+	Kind  DiscoverdEventKind
+	Peers []*discoverd.Instance
+	State *discoverd.ServiceMeta
 }
 
 type Peer struct {
@@ -86,7 +114,7 @@ type Peer struct {
 
 	// External Interfaces
 	log       log15.Logger
-	discoverd discoverd.Service
+	discoverd Discoverd
 	postgres  Postgres
 
 	// Dynamic state
@@ -99,28 +127,146 @@ type Peer struct {
 	clusterState      *State                // last received cluster state
 	clusterPeers      []*discoverd.Instance // last received list of peers
 
-	pgOnline        *bool     // nil for unknown
-	pgSetup         bool      // whether db existed at start
-	pgApplied       *PgConfig // last configuration applied
-	pgTransitioning bool
-	pgRetryPending  *time.Time
-	pgRetryCount    int                 // consecutive failed retries
-	pgUpstream      *discoverd.Instance // upstream replication target
+	pgOnline       *bool     // nil for unknown
+	pgSetup        bool      // whether db existed at start
+	pgApplied      *PgConfig // last configuration applied
+	pgRetryPending *time.Time
+	pgRetryCount   int                 // consecutive failed retries
+	pgUpstream     *discoverd.Instance // upstream replication target
 
 	movingAt *time.Time
 
-	// tick is used to trigger a state evaluation, usually in the future after
-	// an error
-	tick chan struct{}
+	evalStateCh chan struct{}
+	applyConfCh chan struct{}
+	restCh      chan struct{}
+}
+
+func NewPeer(d Discoverd, pg Postgres, log log15.Logger) *Peer {
+	return &Peer{
+		postgres:    pg,
+		discoverd:   d,
+		log:         log,
+		evalStateCh: make(chan struct{}, 1),
+		applyConfCh: make(chan struct{}, 1),
+	}
 }
 
 func (p *Peer) Run() {
+	discoverdCh := p.discoverd.Events()
+	postgresCh := p.postgres.Events()
 	for {
 		select {
-		// discoverd events
-		// postgres events
-		case <-p.tick:
+		// try to run any pending configuration first
+		case <-p.applyConfCh:
+			p.pgApplyConfig()
+		default:
 		}
+		select {
+		case e := <-discoverdCh:
+			switch e.Kind {
+			case DiscoverdEventInit:
+				p.handleDiscoverdInit(e)
+			case DiscoverdEventState:
+				p.handleDiscoverdState(e)
+			case DiscoverdEventPeers:
+				p.handleDiscoverdPeers(e)
+			}
+		case e := <-postgresCh:
+			p.handlePgInit(e)
+			// we're only waiting for a single event, so nil out the channel
+			// after we get it
+			postgresCh = nil
+		case <-p.evalStateCh:
+			p.moving()
+			p.evalClusterState(false)
+		case <-p.applyConfCh:
+			p.pgApplyConfig()
+		}
+	}
+}
+
+func (p *Peer) handlePgInit(e PostgresEvent) {
+	if p.pgOnline != nil {
+		panic("received postgres init event after already initialized")
+	}
+
+	p.pgOnline = &e.Online
+	p.pgSetup = e.Setup
+
+	if p.clusterPeers != nil {
+		p.moving()
+		p.evalClusterState(false)
+	}
+}
+
+func (p *Peer) handleDiscoverdInit(e *DiscoverdEvent) {
+	if p.clusterState != nil {
+		panic("received discoverd init after already initialized")
+	}
+
+	p.clusterPeers = e.Peers
+	p.decodeState(e)
+	if p.pgOnline != nil {
+		p.moving()
+		p.evalClusterState(false)
+	}
+}
+
+func (p *Peer) handleDiscoverdPeers(e *DiscoverdEvent) {
+	if p.clusterPeers == nil {
+		panic("received discoverd peers before init")
+	}
+
+	p.clusterPeers = e.Peers
+	p.moving()
+	p.evalClusterState(false)
+}
+
+func (p *Peer) handleDiscoverdState(e *DiscoverdEvent) {
+	if p.clusterPeers == nil {
+		panic("received discoverd state before init")
+	}
+	p.decodeState(e)
+	p.moving()
+	p.evalClusterState(false)
+}
+
+func (p *Peer) decodeState(e *DiscoverdEvent) {
+	p.clusterStateIndex = e.State.Index
+	if len(e.State.Data) == 0 {
+		p.clusterState = nil
+		return
+	}
+	p.clusterState = &State{}
+	if err := json.Unmarshal(e.State.Data, p.clusterState); err != nil {
+		panic(err)
+	}
+}
+
+// evalLater triggers a cluster state evaluation after delay has elapsed
+func (p *Peer) evalLater(delay time.Duration) {
+	time.AfterFunc(delay, p.triggerEval)
+}
+
+func (p *Peer) applyConfigLater(delay time.Duration) {
+	time.AfterFunc(delay, p.triggerApplyConfig)
+}
+
+func (p *Peer) triggerEval() {
+	select {
+	case p.evalStateCh <- struct{}{}:
+	default:
+		// if we can't send to the channel, there is already a pending state
+		// evaluation, as it is buffered
+	}
+}
+
+func (p *Peer) triggerApplyConfig() {
+	select {
+	case p.applyConfCh <- struct{}{}:
+	default:
+		// if we can't send to the channel, there is already a pending
+		// configuration, as it is buffered
 	}
 }
 
@@ -140,13 +286,15 @@ func (p *Peer) rest() {
 	// a postgres transitioning happening, we're still moving. Similarly, if
 	// we're in the middle of an update and we come to rest because a postgres
 	// transition completed, then wait for the update to finish.
-	if p.pgTransitioning || p.updating {
+	if p.updating {
 		return
 	}
 
 	p.movingAt = nil
 	p.log.Debug("at rest", "fn", "rest")
-	// TODO: this.emit('rest');
+	if p.restCh != nil {
+		p.restCh <- struct{}{}
+	}
 }
 
 func (p *Peer) atRest() bool {
@@ -368,21 +516,21 @@ func (p *Peer) startInitialSetup() {
 	p.updating = false
 	p.updatingState = nil
 
-	go p.sendTick()
+	p.triggerEval()
 }
 
 func (p *Peer) assumeUnassigned() {
 	p.log.Info("assuming unassigned role", "role", "unassigned", "fn", "assumeUnassigned")
 	p.role = RoleUnassigned
 	p.pgUpstream = nil
-	// TODO pgApplyConfig()
+	p.triggerApplyConfig()
 }
 
 func (p *Peer) assumeDeposed() {
 	p.log.Info("assuming deposed role", "role", "deposed", "fn", "assumeDeposed")
 	p.role = RoleDeposed
 	p.pgUpstream = nil
-	// TODO pgApplyConfig()
+	p.triggerApplyConfig()
 }
 
 func (p *Peer) assumePrimary() {
@@ -404,7 +552,7 @@ func (p *Peer) assumePrimary() {
 	// change the desired postgres configuration. In that case, we'll end up
 	// calling pgApplyConfig() again.
 	p.evalClusterState(true)
-	// TODO: pgApplyConfig()
+	p.triggerApplyConfig()
 }
 
 func (p *Peer) assumeSync() {
@@ -417,7 +565,7 @@ func (p *Peer) assumeSync() {
 	p.pgUpstream = p.clusterState.Primary
 	// See assumePrimary()
 	p.evalClusterState(true)
-	// TODO: pgApplyConfig()
+	p.triggerApplyConfig()
 }
 
 func (p *Peer) assumeAsync(i int) {
@@ -432,7 +580,7 @@ func (p *Peer) assumeAsync(i int) {
 	// See assumePrimary(). We don't need to check the cluster state here
 	// because there's never more than one thing to do when becoming the async
 	// peer.
-	// TODO: pgApplyConfig()
+	p.triggerApplyConfig()
 }
 
 func (p *Peer) evalInitClusterState() {
@@ -570,7 +718,7 @@ func (p *Peer) startTakeoverWithPeer(reason string, minWAL xlog.Position, newSta
 	// takeover attempt until postgres is running. (Postgres coming online will
 	// trigger another check of the cluster state that will trigger us to issue
 	// another takeover if appropriate.)
-	if !*p.pgOnline || p.pgTransitioning {
+	if !*p.pgOnline {
 		return ErrPostgresOffline
 	}
 	wal, err := p.postgres.XLogPosition()
@@ -673,7 +821,7 @@ func (p *Peer) startUpdateAsyncs(newAsync []*discoverd.Instance) {
 	p.updating = false
 	p.updatingState = nil
 
-	go p.sendTick()
+	p.triggerEval()
 }
 
 // Reconfigure postgres based on the current configuration. During
@@ -681,16 +829,12 @@ func (p *Peer) startUpdateAsyncs(newAsync []*discoverd.Instance) {
 // cluster state changes will be recorded but otherwise ignored. When
 // reconfiguration completes, if the desired configuration has changed, we'll
 // take another lap to apply the updated configuration.
-func (p *Peer) pgApplyConfig() error {
+func (p *Peer) pgApplyConfig() (err error) {
 	log := p.log.New(log15.Ctx{"fn": "pgApplyConfig"})
 	p.moving()
 
 	if p.pgOnline == nil {
 		panic("pgApplyConfig with postgres in unknown state")
-	}
-	if p.pgTransitioning {
-		log.Info("skipping config apply, already transitioning", "at", "skip")
-		return nil
 	}
 
 	config := p.pgConfig()
@@ -699,28 +843,21 @@ func (p *Peer) pgApplyConfig() error {
 		return nil
 	}
 
-	p.pgTransitioning = true
-
 	defer func() {
-		// handle error
-		/*
-			 // This is a very unexpected error, and it's very
-			 // unclear how to deal with it. If we're the primary or
-			 // sync, we might be tempted to abdicate our position.
-			 // But without understanding the failure mode, there's
-			 // no reason to believe any other peer is in a better
-			 // position to deal with this, and we don't want to flap
-			 // unnecessarily. So just log an error and try again
-			 // shortly.
-			 //
-			err = new VError(err, 'applying pg config');
-			peer.mp_log.error(err);
-			peer.mp_pg_retrypending = new Date();
-			setTimeout(function retryPgApplyConfig() {
-				peer.pgApplyConfig();
-			}, 1000);
-			return;
-		*/
+		if err == nil {
+			return
+		}
+
+		// This is a very unexpected error, and it's very unclear how to deal
+		// with it. If we're the primary or sync, we might be tempted to
+		// abdicate our position. But without understanding the failure mode,
+		// there's no reason to believe any other peer is in a better position
+		// to deal with this, and we don't want to flap unnecessarily. So just
+		// log an error and try again shortly.
+		log.Error("error applying pg config", "err", err)
+		t := time.Now().UTC()
+		p.pgRetryPending = &t
+		p.applyConfigLater(1 * time.Second)
 	}()
 
 	log.Info("reconfiguring postgres")
@@ -747,19 +884,17 @@ func (p *Peer) pgApplyConfig() error {
 			log.Debug("skipping stop, already offline", "at", "skip_stop")
 		}
 	}
-	p.pgTransitioning = false
 
-	/*
-		peer.mp_log.info({ 'nretries': peer.mp_pg_nretries },
-		    'pg: applied config', config);
-	*/
+	log.Info("applied pg config")
 	p.pgRetryPending = nil
 	p.pgApplied = config
-	p.pgOnline = config.Role != RoleNone
+	online := config.Role != RoleNone
+	p.pgOnline = &online
 
 	// Try applying the configuration again in case anything's
 	// changed.  If not, this will be a no-op.
-	p.pgApplyConfig()
+	p.triggerApplyConfig()
+	return nil
 }
 
 func (p *Peer) pgConfig() *PgConfig {
@@ -823,15 +958,4 @@ func (p *Peer) putClusterState() error {
 	}
 	p.clusterStateIndex = meta.Index
 	return nil
-}
-
-// evalLater triggers a cluster state evaluation after delay has elapsed
-func (p *Peer) evalLater(delay time.Duration) {
-	time.AfterFunc(delay, p.sendTick)
-}
-
-// sendTick triggers a cluster state evaluation, it is usually called from
-// a goroutine
-func (p *Peer) sendTick() {
-	p.tick <- struct{}{}
 }
